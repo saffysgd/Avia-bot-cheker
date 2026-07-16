@@ -12,7 +12,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ==================== НАСТРОЙКИ ====================
 
-TELEGRAM_BOT_TOKEN = "8823207989:AAEA4d8sDApbf3T438GnyHRSH9f7-B_BCE"  # Замени на свой токен от @BotFather
+TELEGRAM_BOT_TOKEN = "8823207989:AAEA4dw8sDApbf3T438GnyHRSH9f7-B_BCE"  # Замени на свой токен от @BotFather
 AVIASALES_API_TOKEN = "19311b34c815711c2a8b70f2f3dbffa0"  # Замени на токен из Travelpayouts
 
 # IATA-код Новосибирска (Толмачёво)
