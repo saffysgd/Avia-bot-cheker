@@ -1,14 +1,14 @@
 import asyncio
 import logging
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from calendar import monthrange
 from typing import Optional, Tuple, List, Set
 
 import aiohttp
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ==================== НАСТРОЙКИ ====================
@@ -18,93 +18,20 @@ AVIASALES_API_TOKEN = "19311b34c815711c2a8b70f2f3dbffa0"
 ORIGIN_CITY = "OVB"
 TARGET_CHAT_ID = -1003873649064
 CHECK_INTERVAL_MINUTES = 30
-MIN_DISCOUNT_PERCENT = 20
 SEEN_OFFERS_FILE = "seen_offers.json"
 
 # === ОГРАНИЧЕНИЕ ПО ДАТАМ ===
-SEARCH_MONTHS_AHEAD = 1  # Текущий + 1 месяц
+SEARCH_MONTHS_AHEAD = 1  # Текущий + 1 месяц (до 31 августа 2026)
 
 # === ФИЛЬТР ПО СТРАНАМ ===
-# Только безвизовые для россиян (по состоянию на 2026 год)
 ALLOWED_COUNTRIES = {
-    # === ЕВРОПА (безвизовые) ===
-    "AZ",  # Азербайджан
-    "AM",  # Армения
-    "BY",  # Беларусь
-    "GE",  # Грузия
-    "KZ",  # Казахстан
-    "KG",  # Кыргызстан
-    "MD",  # Молдова
-    "TJ",  # Таджикистан
-    "TM",  # Туркменистан
-    "UZ",  # Узбекистан
-    "UA",  # Украина (по внутреннему паспорту РФ)
-    "RS",  # Сербия
-    "BA",  # Босния и Герцеговина
-    "ME",  # Черногория
-    "MK",  # Северная Македония
-    "AL",  # Албания
-    "TR",  # Турция (электронная виза, но условно включаем)
-    
-    # === АЗИЯ (безвизовые) ===
-    "TH",  # Таиланд
-    "VN",  # Вьетнам
-    "KH",  # Камбоджа
-    "LA",  # Лаос
-    "MY",  # Малайзия
-    "SG",  # Сингапур
-    "ID",  # Индонезия
-    "PH",  # Филиппины
-    "KR",  # Южная Корея
-    "JP",  # Япония (электронная виза, но включаем)
-    "CN",  # Китай (групповая безвиза, отдельные города)
-    "MN",  # Монголия
-    "AE",  # ОАЭ
-    "QA",  # Катар
-    "OM",  # Оман
-    "BH",  # Бахрейн
-    "KW",  # Кувейт
-    "JO",  # Иордания
-    "LB",  # Ливан
-    "IR",  # Иран
-    "PK",  # Пакистан
-    "BD",  # Бангладеш
-    "LK",  # Шри-Ланка
-    "MV",  # Мальдивы
-    "NP",  # Непал
-    "BT",  # Бутан
-    "MM",  # Мьянма
-    "BN",  # Бруней
-    "TL",  # Восточный Тимор
-    
-    # === ДРУГИЕ ===
-    "EG",  # Египет
-    "MA",  # Марокко
-    "TN",  # Тунис
-    "ZA",  # ЮАР
-    "CU",  # Куба
-    "DO",  # Доминикана
-    "VE",  # Венесуэла
-    "BR",  # Бразилия
-    "AR",  # Аргентина
-    "CL",  # Чили
-    "PE",  # Перу
-    "EC",  # Эквадор
-    "BO",  # Боливия
-    "CO",  # Колумбия
-    "UY",  # Уругвай
-    "PY",  # Парагвай
-    "SR",  # Суринам
-    "GY",  # Гайана
-    "FK",  # Фолкленды
-}
-
-# Страны, которые точно НЕ показываем (визовые ЕС, США, Канада и т.д.)
-BLOCKED_COUNTRIES = {
-    "US", "CA", "GB", "FR", "DE", "IT", "ES", "PT", "NL", "BE", "AT", "CH",
-    "SE", "NO", "DK", "FI", "IS", "IE", "PL", "CZ", "SK", "HU", "RO", "BG",
-    "HR", "SI", "LT", "LV", "EE", "LU", "MT", "CY", "GR", "LI", "MC", "SM",
-    "AD", "VA", "AU", "NZ", "IL", "IN",
+    "AZ", "AM", "BY", "GE", "KZ", "KG", "MD", "RU", "TJ", "TM", "UZ", "UA",
+    "RS", "BA", "ME", "MK", "AL", "TR",
+    "TH", "VN", "KH", "LA", "MY", "SG", "ID", "PH", "KR", "JP", "CN", "MN",
+    "AE", "QA", "OM", "BH", "KW", "JO", "LB", "IR", "PK", "BD", "LK", "MV",
+    "NP", "BT", "MM", "BN", "TL",
+    "EG", "MA", "TN", "ZA", "CU", "DO", "VE", "BR", "AR", "CL", "PE", "EC",
+    "BO", "UY", "PY", "SR", "GY", "FK",
 }
 
 # ==================== ЛОГИ ====================
@@ -138,7 +65,8 @@ seen_offers = load_seen_offers()
 # ==================== ОГРАНИЧЕНИЕ ДАТ ====================
 
 def get_max_search_date() -> datetime:
-    today = datetime.now()
+    """Возвращает максимальную дату поиска в UTC."""
+    today = datetime.now(timezone.utc)
     target_year = today.year
     target_month = today.month + SEARCH_MONTHS_AHEAD
     
@@ -147,38 +75,78 @@ def get_max_search_date() -> datetime:
         target_year += 1
     
     last_day = monthrange(target_year, target_month)[1]
-    return datetime(target_year, target_month, last_day, 23, 59, 59)
+    return datetime(target_year, target_month, last_day, 23, 59, 59, tzinfo=timezone.utc)
 
-# ==================== API: ПЕРЕВОД IATA → СТРАНА ====================
+def parse_api_date(date_str: str) -> Optional[datetime]:
+    """Парсит дату из API (форматы: 2027-01-07T13:20:00Z или 2027-01-07T13:20:00+00:00)."""
+    if not date_str:
+        return None
+    
+    try:
+        # Заменяем Z на +00:00 для совместимости с fromisoformat
+        normalized = date_str.replace("Z", "+00:00")
+        return datetime.fromisoformat(normalized)
+    except Exception as e:
+        logger.debug(f"Не удалось распарсить дату '{date_str}': {e}")
+        return None
 
-# Кэш IATA кодов → страна
+def is_date_in_range(date_str: str) -> bool:
+    """Проверяет, что дата в пределах текущего месяца + SEARCH_MONTHS_AHEAD."""
+    dt = parse_api_date(date_str)
+    if not dt:
+        return False
+    
+    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    max_date = get_max_search_date()
+    
+    result = today <= dt <= max_date
+    logger.debug(f"Дата {date_str} -> {dt} | today={today} | max={max_date} | in_range={result}")
+    return result
+
+# ==================== API: АЭРОПОРТЫ ====================
+
 IATA_TO_COUNTRY_CACHE = {}
+AIRPORTS_LOADED = False
+
+async def load_airports_data(session: Optional[aiohttp.ClientSession] = None):
+    global IATA_TO_COUNTRY_CACHE, AIRPORTS_LOADED
+    
+    if AIRPORTS_LOADED and IATA_TO_COUNTRY_CACHE:
+        return
+    
+    url = "https://api.travelpayouts.com/data/ru/airports.json"
+    
+    close_session = False
+    if session is None:
+        session = aiohttp.ClientSession()
+        close_session = True
+    
+    try:
+        async with session.get(url, timeout=15) as resp:
+            if resp.status == 200:
+                airports = await resp.json()
+                for airport in airports:
+                    code = airport.get("code")
+                    country = airport.get("country_code")
+                    if code and country:
+                        IATA_TO_COUNTRY_CACHE[code] = country
+                AIRPORTS_LOADED = True
+                logger.info(f"Загружено {len(IATA_TO_COUNTRY_CACHE)} аэропортов")
+    except Exception as e:
+        logger.warning(f"Не удалось загрузить данные аэропортов: {e}")
+    finally:
+        if close_session:
+            await session.close()
 
 async def get_country_by_iata(iata_code: str) -> Optional[str]:
-    """Определяет страну по IATA коду аэропорта."""
     if not iata_code or len(iata_code) != 3:
         return None
     
-    if iata_code in IATA_TO_COUNTRY_CACHE:
-        return IATA_TO_COUNTRY_CACHE[iata_code]
+    iata_upper = iata_code.upper()
     
-    # Используем API Travelpayouts для получения данных об аэропорте
-    url = "https://api.travelpayouts.com/data/en/airports.json"
+    if iata_upper in IATA_TO_COUNTRY_CACHE:
+        return IATA_TO_COUNTRY_CACHE[iata_upper]
     
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=10) as resp:
-                if resp.status == 200:
-                    airports = await resp.json()
-                    for airport in airports:
-                        if airport.get("code") == iata_code.upper():
-                            country_code = airport.get("country_code")
-                            IATA_TO_COUNTRY_CACHE[iata_code] = country_code
-                            return country_code
-    except Exception as e:
-        logger.warning(f"Не удалось определить страну для {iata_code}: {e}")
-    
-    # Fallback: популярные аэропорты
     fallback = {
         "BKK": "TH", "HKT": "TH", "CNX": "TH", "KBV": "TH", "USM": "TH",
         "SGN": "VN", "HAN": "VN", "DAD": "VN", "NHA": "VN",
@@ -219,29 +187,13 @@ async def get_country_by_iata(iata_code: str) -> Optional[str]:
         "RGN": "MM",
         "BWN": "BN",
         "DIL": "TL",
-        "MLE": "MV",
-        "ALA": "KZ", "NQZ": "KZ",
-        "GYD": "AZ",
-        "EVN": "AM",
-        "TBS": "GE",
+        "SKD": "UZ",  # Самарканд
     }
     
-    country = fallback.get(iata_code.upper())
-    IATA_TO_COUNTRY_CACHE[iata_code] = country
-    return country
-
-def is_allowed_destination(iata_code: str) -> bool:
-    """Проверяет, разрешена ли страна назначения."""
-    if not iata_code:
-        return False
-    
-    # Проверяем по кэшу
-    country = IATA_TO_COUNTRY_CACHE.get(iata_code.upper())
+    country = fallback.get(iata_upper)
     if country:
-        return country.upper() in ALLOWED_COUNTRIES
-    
-    # Если страна не определена — пропускаем (лучше перебдеть)
-    return False
+        IATA_TO_COUNTRY_CACHE[iata_upper] = country
+    return country
 
 # ==================== API AVIASALES ====================
 
@@ -262,6 +214,9 @@ async def fetch_special_offers() -> list:
     }
     
     async with aiohttp.ClientSession() as session:
+        if not AIRPORTS_LOADED:
+            await load_airports_data(session)
+        
         try:
             async with session.get(url, params=params, headers=headers, timeout=30) as resp:
                 if resp.status != 200:
@@ -276,12 +231,9 @@ async def fetch_special_offers() -> list:
                 
                 offers = data.get("data", [])
                 
-                # === ЗАГРУЖАЕМ ДАННЫЕ ОБ АЭРОПОРТАХ ===
-                await load_airports_data(session)
-                
                 # === ФИЛЬТР ПО ДАТАМ И СТРАНАМ ===
                 filtered_offers = []
-                today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+                today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
                 max_date = get_max_search_date()
                 
                 allowed_count = 0
@@ -292,17 +244,20 @@ async def fetch_special_offers() -> list:
                     dest_iata = offer.get("destination", "")
                     dep_raw = offer.get("departure_at", "")
                     
-                    # Фильтр по дате
-                    if dep_raw:
-                        try:
-                            dep_dt = datetime.fromisoformat(dep_raw.replace("Z", "+00:00"))
-                            if dep_dt < today or dep_dt > max_date:
-                                date_filtered += 1
-                                continue
-                        except:
-                            pass
+                    # === ФИЛЬТР ПО ДАТЕ ===
+                    dep_dt = parse_api_date(dep_raw)
+                    if dep_dt:
+                        if dep_dt < today or dep_dt > max_date:
+                            date_filtered += 1
+                            logger.info(f"❌ ОТФИЛЬТРОВАНО ПО ДАТЕ: {dest_iata} | {dep_raw} | {dep_dt.strftime('%d.%m.%Y')}")
+                            continue
+                        else:
+                            logger.info(f"✅ ДАТА ОК: {dest_iata} | {dep_raw} | {dep_dt.strftime('%d.%m.%Y')}")
+                    else:
+                        logger.warning(f"⚠️ Не удалось распарсить дату: {dep_raw}")
+                        continue  # Пропускаем если дату не распарсили
                     
-                    # Фильтр по стране
+                    # === ФИЛЬТР ПО СТРАНЕ ===
                     country = await get_country_by_iata(dest_iata)
                     
                     if country and country.upper() in ALLOWED_COUNTRIES:
@@ -310,13 +265,14 @@ async def fetch_special_offers() -> list:
                         allowed_count += 1
                     else:
                         blocked_count += 1
-                        logger.debug(f"Заблокировано: {dest_iata} → страна {country}")
+                        logger.info(f"❌ ЗАБЛОКИРОВАНО ПО СТРАНЕ: {dest_iata} | страна {country}")
                 
                 logger.info(
-                    f"API: {len(offers)} предложений | "
-                    f"По дате отфильтровано: {date_filtered} | "
+                    f"=== ИТОГО === API: {len(offers)} | "
+                    f"Отфильтровано по дате: {date_filtered} | "
                     f"Разрешено: {allowed_count} | "
-                    f"Заблокировано: {blocked_count}"
+                    f"Заблокировано по стране: {blocked_count} | "
+                    f"Диапазон: {today.strftime('%d.%m.%Y')} - {max_date.strftime('%d.%m.%Y')}"
                 )
                 
                 return filtered_offers
@@ -328,85 +284,9 @@ async def fetch_special_offers() -> list:
             logger.error(f"Ошибка при запросе к API: {e}")
             return []
 
-async def load_airports_data(session: aiohttp.ClientSession):
-    """Загружает данные об аэропортах для кэширования стран."""
-    global IATA_TO_COUNTRY_CACHE
-    
-    if IATA_TO_COUNTRY_CACHE:
-        return  # Уже загружено
-    
-    url = "https://api.travelpayouts.com/data/ru/airports.json"
-    
-    try:
-        async with session.get(url, timeout=15) as resp:
-            if resp.status == 200:
-                airports = await resp.json()
-                for airport in airports:
-                    code = airport.get("code")
-                    country = airport.get("country_code")
-                    if code and country:
-                        IATA_TO_COUNTRY_CACHE[code] = country
-                logger.info(f"Загружено {len(IATA_TO_COUNTRY_CACHE)} аэропортов")
-    except Exception as e:
-        logger.warning(f"Не удалось загрузить данные аэропортов: {e}")
-
 # ==================== ФОРМАТИРОВАНИЕ ====================
 
-def format_offer_message(offer: dict) -> Tuple[str, str]:
-    origin_name = offer.get("origin_name", offer.get("origin", "Неизвестно"))
-    destination_name = offer.get("destination_name", offer.get("destination", "Неизвестно"))
-    dest_iata = offer.get("destination", "")
-    price = offer.get("price", 0)
-    airline = offer.get("airline_title", offer.get("airline", "Неизвестно"))
-    flight_number = offer.get("flight_number", "")
-    
-    # Дата вылета
-    departure_raw = offer.get("departure_at", "")
-    try:
-        departure_dt = datetime.fromisoformat(departure_raw.replace("Z", "+00:00"))
-        departure_str = departure_dt.strftime("%d %B %Y, %H:%M")
-    except:
-        departure_str = departure_raw
-    
-    # Дата возврата
-    return_raw = offer.get("return_at", "")
-    return_str = ""
-    if return_raw:
-        try:
-            return_dt = datetime.fromisoformat(return_raw.replace("Z", "+00:00"))
-            return_str = f"\n🔙 <b>Обратно:</b> {return_dt.strftime('%d %B %Y, %H:%M')}"
-        except:
-            return_str = f"\n🔙 <b>Обратно:</b> {return_raw}"
-    
-    # Длительность перелёта
-    duration = offer.get("duration", 0)
-    duration_str = f"{duration // 60}ч {duration % 60}м" if duration else "Неизвестно"
-    
-    # Ссылка на билет
-    link_suffix = offer.get("link", "")
-    search_link = f"https://www.aviasales.ru/search{link_suffix}" if link_suffix else "https://www.aviasales.ru"
-    
-    # Уникальный ID предложения
-    offer_id = offer.get("search_id", "") or offer.get("signature", "")
-    
-    # Флаг страны (если известен)
-    country = IATA_TO_COUNTRY_CACHE.get(dest_iata.upper(), "")
-    country_flag = get_country_flag(country)
-    
-    message = (
-        f"✈️ <b>Горящее предложение!</b> {country_flag}\n\n"
-        f"🛫 <b>{origin_name}</b> → <b>{destination_name}</b>\n"
-        f"💰 <b>Цена:</b> {price:,} ₽\n"
-        f"🏢 <b>Авиакомпания:</b> {airline} {flight_number}\n"
-        f"📅 <b>Вылет:</b> {departure_str}{return_str}\n"
-        f"⏱ <b>В пути:</b> {duration_str}\n\n"
-        f"🔗 <a href='{search_link}'>Посмотреть на Aviasales</a>"
-    )
-    
-    return message, offer_id
-
 def get_country_flag(country_code: str) -> str:
-    """Возвращает флаг страны по коду."""
     flags = {
         "TH": "🇹🇭", "VN": "🇻🇳", "ID": "🇮🇩", "MY": "🇲🇾", "SG": "🇸🇬",
         "PH": "🇵🇭", "KR": "🇰🇷", "JP": "🇯🇵", "CN": "🇨🇳", "MN": "🇲🇳",
@@ -424,6 +304,59 @@ def get_country_flag(country_code: str) -> str:
     }
     return flags.get(country_code.upper(), "🌍")
 
+def format_offer_message(offer: dict) -> Tuple[str, str]:
+    origin_name = offer.get("origin_name", offer.get("origin", "Неизвестно"))
+    destination_name = offer.get("destination_name", offer.get("destination", "Неизвестно"))
+    dest_iata = offer.get("destination", "")
+    price = offer.get("price", 0)
+    airline = offer.get("airline_title", offer.get("airline", "Неизвестно"))
+    flight_number = offer.get("flight_number", "")
+    
+    departure_raw = offer.get("departure_at", "")
+    try:
+        dep_dt = parse_api_date(departure_raw)
+        if dep_dt:
+            departure_str = dep_dt.strftime("%d %B %Y, %H:%M")
+        else:
+            departure_str = departure_raw
+    except:
+        departure_str = departure_raw
+    
+    return_raw = offer.get("return_at", "")
+    return_str = ""
+    if return_raw:
+        try:
+            ret_dt = parse_api_date(return_raw)
+            if ret_dt:
+                return_str = f"\n🔙 <b>Обратно:</b> {ret_dt.strftime('%d %B %Y, %H:%M')}"
+            else:
+                return_str = f"\n🔙 <b>Обратно:</b> {return_raw}"
+        except:
+            return_str = f"\n🔙 <b>Обратно:</b> {return_raw}"
+    
+    duration = offer.get("duration", 0)
+    duration_str = f"{duration // 60}ч {duration % 60}м" if duration else "Неизвестно"
+    
+    link_suffix = offer.get("link", "")
+    search_link = f"https://www.aviasales.ru/search{link_suffix}" if link_suffix else "https://www.aviasales.ru"
+    
+    offer_id = offer.get("search_id", "") or offer.get("signature", "")
+    
+    country = IATA_TO_COUNTRY_CACHE.get(dest_iata.upper(), "")
+    country_flag = get_country_flag(country)
+    
+    message = (
+        f"✈️ <b>Горящее предложение!</b> {country_flag}\n\n"
+        f"🛫 <b>{origin_name}</b> → <b>{destination_name}</b>\n"
+        f"💰 <b>Цена:</b> {price:,} ₽\n"
+        f"🏢 <b>Авиакомпания:</b> {airline} {flight_number}\n"
+        f"📅 <b>Вылет:</b> {departure_str}{return_str}\n"
+        f"⏱ <b>В пути:</b> {duration_str}\n\n"
+        f"🔗 <a href='{search_link}'>Посмотреть на Aviasales</a>"
+    )
+    
+    return message, offer_id
+
 # ==================== ОТПРАВКА ====================
 
 async def send_new_offers():
@@ -434,7 +367,7 @@ async def send_new_offers():
     
     if not offers:
         logger.info("Новых предложений не найдено")
-        return
+        return 0
     
     new_count = 0
     
@@ -453,35 +386,43 @@ async def send_new_offers():
             )
             seen_offers.add(offer_id)
             new_count += 1
-            logger.info(f"Отправлено предложение: {offer_id}")
+            logger.info(f"Отправлено: {offer_id}")
             await asyncio.sleep(1)
             
+        except TelegramForbiddenError as e:
+            logger.error(f"❌ Бот заблокирован в чате {TARGET_CHAT_ID}!")
+            return new_count
+            
+        except TelegramBadRequest as e:
+            logger.error(f"❌ Ошибка Telegram: {e}")
+            if "chat not found" in str(e).lower():
+                logger.error(f"❌ Чат {TARGET_CHAT_ID} не найден!")
+            return new_count
+            
         except Exception as e:
-            logger.error(f"Ошибка отправки: {e}")
+            logger.error(f"❌ Ошибка отправки: {e}")
     
     if new_count > 0:
         save_seen_offers(seen_offers)
         logger.info(f"Отправлено {new_count} новых предложений")
     else:
         logger.info("Новых уникальных предложений не найдено")
+    
+    return new_count
 
 # ==================== КОМАНДЫ ====================
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     max_date = get_max_search_date()
-    countries_count = len(ALLOWED_COUNTRIES)
     await message.answer(
         f"🤖 <b>Бот спецпредложений Aviasales</b>\n\n"
         f"📍 Город вылета: Новосибирск (OVB)\n"
         f"📅 Ищем билеты до: <b>{max_date.strftime('%d %B %Y')}</b>\n"
-        f"🌍 Стран: <b>{countries_count}</b> безвизовых направлений\n\n"
-        f"Показываем только:\n"
-        f"• 🇪🇺 Европа (СНГ, Балканы, Турция)\n"
-        f"• 🌏 Азия (ЮВА, Ближний Восток, Средняя Азия)\n\n"
+        f"🌍 Безвизовые направления для россиян\n\n"
         f"<b>Команды:</b>\n"
         f"/check — проверить предложения\n"
-        f"/countries — список стран\n"
+        f"/test — тест отправки в группу\n"
         f"/status — статус\n"
         f"/help — справка",
         parse_mode="HTML"
@@ -490,87 +431,60 @@ async def cmd_start(message: types.Message):
 @dp.message(Command("check"))
 async def cmd_check(message: types.Message):
     await message.answer("🔍 Проверяю предложения...")
-    await send_new_offers()
-    await message.answer("✅ Проверка завершена!")
-
-@dp.message(Command("countries"))
-async def cmd_countries(message: types.Message):
-    """Показывает список разрешённых стран."""
-    # Группируем по регионам
-    europe = []
-    asia = []
-    other = []
-    
-    country_names = {
-        "AZ": "🇦🇿 Азербайджан", "AM": "🇦🇲 Армения", "BY": "🇧🇾 Беларусь",
-        "GE": "🇬🇪 Грузия", "KZ": "🇰🇿 Казахстан", "KG": "🇰🇬 Кыргызстан",
-        "MD": "🇲🇩 Молдова", "RU": "🇷🇺 Россия", "TJ": "🇹🇯 Таджикистан",
-        "TM": "🇹🇲 Туркменистан", "UZ": "🇺🇿 Узбекистан", "UA": "🇺🇦 Украина",
-        "RS": "🇷🇸 Сербия", "BA": "🇧🇦 Босния и Герцеговина", "ME": "🇲🇪 Черногория",
-        "MK": "🇲🇰 Северная Македония", "AL": "🇦🇱 Албания", "TR": "🇹🇷 Турция",
-        "TH": "🇹🇭 Таиланд", "VN": "🇻🇳 Вьетнам", "KH": "🇰🇭 Камбоджа",
-        "LA": "🇱🇦 Лаос", "MY": "🇲🇾 Малайзия", "SG": "🇸🇬 Сингапур",
-        "ID": "🇮🇩 Индонезия", "PH": "🇵🇭 Филиппины", "KR": "🇰🇷 Южная Корея",
-        "JP": "🇯🇵 Япония", "CN": "🇨🇳 Китай", "MN": "🇲🇳 Монголия",
-        "AE": "🇦🇪 ОАЭ", "QA": "🇶🇦 Катар", "OM": "🇴🇲 Оман",
-        "BH": "🇧🇭 Бахрейн", "KW": "🇰🇼 Кувейт", "JO": "🇯🇴 Иордания",
-        "LB": "🇱🇧 Ливан", "IR": "🇮🇷 Иран", "PK": "🇵🇰 Пакистан",
-        "BD": "🇧🇩 Бангладеш", "LK": "🇱🇰 Шри-Ланка", "MV": "🇲🇻 Мальдивы",
-        "NP": "🇳🇵 Непал", "BT": "🇧🇹 Бутан", "MM": "🇲🇲 Мьянма",
-        "BN": "🇧🇳 Бруней", "TL": "🇹🇱 Восточный Тимор",
-        "EG": "🇪🇬 Египет", "MA": "🇲🇦 Марокко", "TN": "🇹🇳 Тунис",
-        "ZA": "🇿🇦 ЮАР", "CU": "🇨🇺 Куба", "DO": "🇩🇴 Доминикана",
-        "VE": "🇻🇪 Венесуэла", "BR": "🇧🇷 Бразилия", "AR": "🇦🇷 Аргентина",
-        "CL": "🇨🇱 Чили", "PE": "🇵🇪 Перу", "EC": "🇪🇨 Эквадор",
-        "BO": "🇧🇴 Боливия", "UY": "🇺🇾 Уругвай", "PY": "🇵🇾 Парагвай",
-    }
-    
-    for code in sorted(set(ALLOWED_COUNTRIES)):
-        name = country_names.get(code, f"🏳️ {code}")
-        if code in ["AZ", "AM", "BY", "GE", "KZ", "KG", "MD", "RU", "TJ", "TM", "UZ", "UA",
-                    "RS", "BA", "ME", "MK", "AL", "TR"]:
-            europe.append(name)
-        elif code in ["EG", "MA", "TN", "ZA", "CU", "DO", "VE", "BR", "AR", "CL", "PE",
-                      "EC", "BO", "UY", "PY", "SR", "GY", "FK"]:
-            other.append(name)
-        else:
-            asia.append(name)
-    
-    text = "🌍 <b>Безвизовые направления для россиян</b>\n\n"
-    text += f"🇪🇺 <b>Европа и СНГ ({len(europe)}):</b>\n" + "\n".join(europe) + "\n\n"
-    text += f"🌏 <b>Азия ({len(asia)}):</b>\n" + "\n".join(asia) + "\n\n"
-    if other:
-        text += f"🌎 <b>Другие ({len(other)}):</b>\n" + "\n".join(other)
-    
-    # Разбиваем на части если слишком длинно
-    if len(text) > 4000:
-        parts = []
-        current = ""
-        for line in text.split("\n"):
-            if len(current) + len(line) + 1 > 4000:
-                parts.append(current)
-                current = line + "\n"
-            else:
-                current += line + "\n"
-        if current:
-            parts.append(current)
-        
-        for part in parts:
-            await message.answer(part, parse_mode="HTML")
+    count = await send_new_offers()
+    if count == 0:
+        await message.answer("📭 Новых предложений нет.")
     else:
-        await message.answer(text, parse_mode="HTML")
+        await message.answer(f"✅ Отправлено {count} предложений!")
+
+@dp.message(Command("test"))
+async def cmd_test(message: types.Message):
+    await message.answer(f"🧪 Отправляю тест в чат {TARGET_CHAT_ID}...")
+    
+    try:
+        test_msg = await bot.send_message(
+            chat_id=TARGET_CHAT_ID,
+            text="🧪 <b>Тестовое сообщение</b>\n\nЕсли ты видишь это — бот работает!",
+            parse_mode="HTML"
+        )
+        await message.answer(f"✅ Тест отправлен! Message ID: {test_msg.message_id}")
+        
+    except TelegramForbiddenError:
+        await message.answer(
+            "❌ <b>Ошибка:</b> Бот заблокирован в группе!\n\n"
+            "Решение:\n"
+            "1. Добавь бота в группу\n"
+            "2. Сделай бота <b>администратором</b>",
+            parse_mode="HTML"
+        )
+        
+    except TelegramBadRequest as e:
+        if "chat not found" in str(e).lower():
+            await message.answer(
+                f"❌ <b>Чат не найден!</b>\n\n"
+                f"Текущий TARGET_CHAT_ID: <code>{TARGET_CHAT_ID}</code>\n\n"
+                f"Как получить правильный ID:\n"
+                f"1. Добавь бота в группу\n"
+                f"2. Отправь любое сообщение\n"
+                f"3. Перейди: <code>https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates</code>",
+                parse_mode="HTML"
+            )
+        else:
+            await message.answer(f"❌ Ошибка: {e}")
 
 @dp.message(Command("status"))
 async def cmd_status(message: types.Message):
     max_date = get_max_search_date()
+    today = datetime.now(timezone.utc)
     await message.answer(
-        f"📊 <b>Статус бота</b>\n\n"
-        f"🛫 Город вылета: Новосибирск (OVB)\n"
-        f"📅 Диапазон поиска: до {max_date.strftime('%d %B %Y')}\n"
-        f"🌍 Безвизовых стран: {len(ALLOWED_COUNTRIES)}\n"
-        f"⏱ Интервал проверки: каждые {CHECK_INTERVAL_MINUTES} мин\n"
-        f"📨 Отправлено предложений: {len(seen_offers)}\n"
-        f"✅ Бот работает",
+        f"📊 <b>Статус</b>\n\n"
+        f"🛫 Город: Новосибирск (OVB)\n"
+        f"📅 Сегодня: {today.strftime('%d %B %Y')}\n"
+        f"📅 До: {max_date.strftime('%d %B %Y')}\n"
+        f"🌍 Стран: {len(set(ALLOWED_COUNTRIES))}\n"
+        f"🎯 Чат ID: <code>{TARGET_CHAT_ID}</code>\n"
+        f"⏱ Интервал: {CHECK_INTERVAL_MINUTES} мин\n"
+        f"📨 Отправлено: {len(seen_offers)}",
         parse_mode="HTML"
     )
 
@@ -578,24 +492,58 @@ async def cmd_status(message: types.Message):
 async def cmd_help(message: types.Message):
     await message.answer(
         "📖 <b>Справка</b>\n\n"
-        "Бот показывает только безвизовые направления для россиян:\n"
-        "• 🇪🇺 Европа: СНГ, Балканы, Турция, Грузия, Армения\n"
-        "• 🌏 Азия: Таиланд, Вьетнам, ОАЭ, Корея, Япония и др.\n\n"
-        "Исключены: 🇪🇺 ЕС (шенген), 🇺🇸 США, 🇨🇦 Канада и др.\n\n"
+        "Бот показывает только безвизовые направления:\n"
+        "• 🇪🇺 СНГ, Балканы, Турция, Грузия, Армения\n"
+        "• 🌏 Таиланд, Вьетнам, ОАЭ, Корея, Япония и др.\n\n"
+        "❌ Исключены: ЕС (шенген), США, Канада\n\n"
         "<b>Команды:</b>\n"
         "/check — проверить сейчас\n"
-        "/countries — список стран\n"
-        "/status — статус\n"
-        "/start — главное меню",
+        "/test — тест отправки\n"
+        "/status — статус",
         parse_mode="HTML"
     )
 
 # ==================== ЗАПУСК ====================
 
 async def main():
+    await load_airports_data()
+    
+    # Диагностика чата
+    logger.info("=" * 60)
+    logger.info("ДИАГНОСТИКА ЧАТА")
+    logger.info(f"TARGET_CHAT_ID: {TARGET_CHAT_ID}")
+    
+    try:
+        chat = await bot.get_chat(TARGET_CHAT_ID)
+        logger.info(f"✅ Чат найден: {chat.title or chat.full_name}")
+        logger.info(f"   Тип: {chat.type}")
+        
+        test = await bot.send_message(
+            chat_id=TARGET_CHAT_ID,
+            text="🤖 Бот запущен и готов к работе!",
+            parse_mode="HTML"
+        )
+        logger.info(f"✅ Тест отправлен! Message ID: {test.message_id}")
+        
+    except TelegramForbiddenError:
+        logger.error("❌ Бот НЕ имеет доступа к чату!")
+        logger.error("   Решение: добавь бота в группу и сделай администратором")
+        
+    except TelegramBadRequest as e:
+        if "chat not found" in str(e).lower():
+            logger.error("❌ Чат не найден!")
+            logger.error(f"   Проверь TARGET_CHAT_ID: {TARGET_CHAT_ID}")
+        else:
+            logger.error(f"❌ Ошибка: {e}")
+            
+    except Exception as e:
+        logger.error(f"❌ Неизвестная ошибка: {e}")
+    
+    logger.info("=" * 60)
+    
     max_date = get_max_search_date()
-    logger.info(f"Максимальная дата поиска: {max_date.strftime('%d.%m.%Y')}")
-    logger.info(f"Разрешено стран: {len(ALLOWED_COUNTRIES)}")
+    logger.info(f"Макс. дата: {max_date.strftime('%d.%m.%Y')}")
+    logger.info(f"Стран: {len(set(ALLOWED_COUNTRIES))}")
     
     scheduler = AsyncIOScheduler()
     scheduler.add_job(
@@ -608,7 +556,6 @@ async def main():
     scheduler.start()
     
     logger.info("Бот запущен!")
-    logger.info(f"Проверка каждые {CHECK_INTERVAL_MINUTES} минут")
     
     await send_new_offers()
     await dp.start_polling(bot)
